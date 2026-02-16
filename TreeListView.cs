@@ -44,8 +44,10 @@ using System.Collections.Specialized;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Linq;
+using System.Reactive.Linq;
 using Avalonia;
 using Avalonia.Controls;
+using Avalonia.Controls.Presenters;
 using Avalonia.Controls.Primitives;
 using Avalonia.Controls.Shapes;
 using Avalonia.Controls.Templates;
@@ -153,7 +155,7 @@ public class TreeListView : Grid
         }
     }
 
-    private readonly StackPanel _rows;
+    private readonly TreeListViewRows _rows;
     private readonly Row _header;
     private readonly ObservableCollectionExtended<TreeListViewItem> _rootItems = new();
     private readonly TreeFlattener<TreeListViewItem> flattener;
@@ -164,21 +166,104 @@ public class TreeListView : Grid
 
         RowDefinitions.Add(new(GridLength.Auto));
         RowDefinitions.Add(new(GridLength.Star));
+        RowDefinitions.Add(new(GridLength.Auto));
 
-        _header = new Row();
-        _rows = new StackPanel();
+        ColumnDefinitions.Add(new(GridLength.Star));
+        ColumnDefinitions.Add(new(GridLength.Auto));
 
-        var headerScrollViewer = new ScrollViewer()
+        _header = new Row(this);
+        _rows = new(this);
+
+        var headerScrollViewer = new ScrollContentPresenter()
         {
             [Grid.RowProperty] = 0,
             Content = _header,
-            HorizontalScrollBarVisibility = ScrollBarVisibility.Hidden,
-            VerticalScrollBarVisibility = ScrollBarVisibility.Disabled
+            CanHorizontallyScroll = true,
         };
         Children.Add(headerScrollViewer);
-        ScrollViewer contentScrollViewer = new ScrollViewer() { Content = _rows, [Grid.RowProperty] = 1, HorizontalScrollBarVisibility = ScrollBarVisibility.Auto };
-        headerScrollViewer[!ScrollViewer.OffsetProperty] = contentScrollViewer[!ScrollViewer.OffsetProperty];
+        ScrollContentPresenter contentScrollViewer = new ScrollContentPresenter()
+        {
+            [Grid.RowProperty] = 1,
+            Content = _rows,
+            CanHorizontallyScroll = true,
+            CanVerticallyScroll = true,
+        };
         Children.Add(contentScrollViewer);
+
+        var hsb = new ScrollBar()
+        {
+            [RowProperty] = 2,
+            Orientation = Orientation.Horizontal,
+            AllowAutoHide = false,
+            Visibility = ScrollBarVisibility.Auto,
+            [!ScrollBar.ViewportSizeProperty] =
+                contentScrollViewer.GetObservable(ScrollContentPresenter.ViewportProperty).Select(x => x.Width).ToBinding(),
+            [!ScrollBar.MaximumProperty] =
+                contentScrollViewer.GetObservable(ScrollContentPresenter.ViewportProperty)
+                    .CombineLatest(contentScrollViewer.GetObservable(ScrollContentPresenter.ExtentProperty))
+                    .Select(x => Max(x.Second.Width - x.First.Width, 0))
+                    .ToBinding(),
+        };
+
+        bool isHorizontalScroll = false;
+        hsb.ValueChanged += (sender, args) =>
+        {
+            if (isHorizontalScroll) return;
+            isHorizontalScroll = true;
+            contentScrollViewer.Offset = contentScrollViewer.Offset.WithX(args.NewValue);
+            headerScrollViewer.Offset = headerScrollViewer.Offset.WithX(args.NewValue);
+            isHorizontalScroll = false;
+        };
+        contentScrollViewer.GetObservable(ScrollContentPresenter.OffsetProperty).Subscribe(UpdateX);
+        headerScrollViewer.GetObservable(ScrollContentPresenter.OffsetProperty).Subscribe(UpdateX);
+
+        void UpdateX(Vector vector)
+        {
+            contentScrollViewer.Offset = contentScrollViewer.Offset.WithX(vector.X);
+            headerScrollViewer.Offset = headerScrollViewer.Offset.WithX(vector.X);
+            hsb.Value = vector.X;
+        }
+
+        Children.Add(hsb);
+
+        var vsb = new ScrollBar()
+        {
+            Orientation = Orientation.Vertical,
+            [ColumnProperty] = 1,
+            [RowProperty] = 1,
+            AllowAutoHide = false,
+            Visibility = ScrollBarVisibility.Auto,
+            [!ScrollBar.ViewportSizeProperty] =
+                contentScrollViewer.GetObservable(ScrollContentPresenter.ViewportProperty).Select(x => x.Height).ToBinding(),
+            [!ScrollBar.MaximumProperty] =
+                contentScrollViewer.GetObservable(ScrollContentPresenter.ViewportProperty)
+                    .CombineLatest(contentScrollViewer.GetObservable(ScrollContentPresenter.ExtentProperty))
+                    .Select(x => Max(x.Second.Height - x.First.Height, 0))
+                    .ToBinding(),
+        };
+        bool isVerticalScroll = false;
+        vsb.ValueChanged += (sender, args) =>
+        {
+            if (isVerticalScroll) return;
+            isVerticalScroll = true;
+            contentScrollViewer.Offset = contentScrollViewer.Offset.WithY(args.NewValue);
+            isVerticalScroll = false;
+        };
+        contentScrollViewer.GetObservable(ScrollContentPresenter.OffsetProperty).Subscribe(UpdateY);
+
+        void UpdateY(Vector vector)
+        {
+            contentScrollViewer.Offset = contentScrollViewer.Offset.WithY(vector.Y);
+            vsb.Value = vector.Y;
+        }
+
+        Children.Add(vsb);
+
+        static double Max(double x, double y)
+        {
+            var result = Math.Max(x, y);
+            return double.IsNaN(result) ? 0 : result;
+        }
 
         flattener = new(
             source: new(_rootItems),
@@ -404,20 +489,13 @@ public class TreeListView : Grid
 
         protected override Size MeasureOverride(Size availableSize)
         {
-            var size = base.MeasureOverride(availableSize);
-            var headerWidth = headerColumn.DesiredSize.Width;
-            if (!double.IsNaN(headerColumn.Width))
+            if (parent.ParentTree._isFirstTimeMeasuringCells)
             {
-                return size.WithWidth(headerWidth);
+                return base.MeasureOverride(availableSize);
             }
 
-            if (headerWidth >= size.Width)
-            {
-                return size.WithWidth(headerWidth);
-            }
-
-            headerColumn.ChildColumnWidth = size.Width;
-            return size;
+            var size = base.MeasureOverride(availableSize.WithWidth(headerColumn.DesiredSize.Width));
+            return size.WithWidth(headerColumn.DesiredSize.Width);
         }
 
         public override void Render(DrawingContext context)
@@ -439,6 +517,7 @@ public class TreeListView : Grid
 
     public class Row : Control
     {
+        private readonly TreeListView parent;
         public static readonly StyledProperty<IBrush?> BackgroundProperty = AvaloniaProperty.Register<Row, IBrush?>(nameof(Background));
 
         private double? beforeDetailsRowHeight;
@@ -468,8 +547,9 @@ public class TreeListView : Grid
             AffectsRender<Row>(ShowSeparatorsProperty);
         }
 
-        public Row()
+        public Row(TreeListView parent)
         {
+            this.parent = parent;
             Children.CollectionChanged += ChildrenChanged;
         }
 
@@ -562,6 +642,11 @@ public class TreeListView : Grid
 
             foreach (var child in Children)
             {
+                if (parent._isResizingColumns)
+                {
+                    child.InvalidateMeasure();
+                }
+
                 child.Measure(constrainedSize);
                 var childSize = child.DesiredSize;
 
@@ -663,34 +748,126 @@ public class TreeListView : Grid
         }
     }
 
+    private bool _isResizingColumns;
+    private bool _isFirstTimeMeasuringCells = true;
+
+    void ScheduleResize()
+    {
+        _isResizingColumns = true;
+        _rows.InvalidateMeasure();
+    }
+
     public class HeaderCell(TreeListView parent, GridViewColumn column) : Cell
     {
-        private double childColumnWidth;
-
-        internal double ChildColumnWidth
-        {
-            get => childColumnWidth;
-            set
-            {
-                childColumnWidth = value;
-                InvalidateMeasure();
-            }
-        }
-
         public GridViewColumn Column { get; } = column;
 
         protected override Size MeasureCore(Size availableSize)
         {
             Size size = base.MeasureCore(availableSize);
 
-            if (double.IsNaN(Width) && ChildColumnWidth > size.Width)
-            {
-                size = size.WithWidth(ChildColumnWidth);
-            }
-
-            foreach (var c in parent._rows.Children.Cast<Row>().SelectMany(x => x.Children).OfType<Cell>()) c.InvalidateMeasure();
+            parent.ScheduleResize();
 
             return size;
+        }
+    }
+
+    public class TreeListViewRows(TreeListView parent) : Panel
+    {
+        protected override Size MeasureOverride(Size availableSize)
+        {
+            Size stackDesiredSize = new Size();
+            var children = Children;
+            Size layoutSlotSize = availableSize;
+            bool hasVisibleChild = false;
+
+            layoutSlotSize = layoutSlotSize.WithHeight(double.PositiveInfinity);
+
+            for (int i = 0, count = children.Count; i < count; ++i)
+            {
+                var child = children[i];
+
+                bool isVisible = child.IsVisible;
+
+                if (isVisible && !hasVisibleChild)
+                {
+                    hasVisibleChild = true;
+                }
+
+                if (parent._isResizingColumns)
+                {
+                    child.InvalidateMeasure();
+                }
+
+                child.Measure(layoutSlotSize);
+                Size childDesiredSize = child.DesiredSize;
+
+                stackDesiredSize = stackDesiredSize.WithWidth(Math.Max(stackDesiredSize.Width, childDesiredSize.Width));
+                stackDesiredSize = stackDesiredSize.WithHeight(stackDesiredSize.Height + childDesiredSize.Height);
+            }
+
+            parent._isResizingColumns = false;
+
+            var headerChildren = parent._header.Children;
+            if (parent._isFirstTimeMeasuringCells && headerChildren.Count > 0)
+            {
+                double[] widths = new double[headerChildren.Count];
+                for (int testRows = 0; testRows < Math.Min(20, children.Count); testRows++)
+                {
+                    var row = (Row)children[testRows];
+                    for (int i = 0; i < Math.Min(headerChildren.Count, row.Children.Count); i++)
+                    {
+                        var cellWidth = row.Children[i].DesiredSize.Width;
+                        if (widths[i] < cellWidth)
+                        {
+                            widths[i] = cellWidth;
+                        }
+                    }
+                }
+
+                for (int i = 0; i < widths.Length; i++)
+                {
+                    var headerCell = (HeaderCell)headerChildren[i];
+                    if (!double.IsNaN(headerCell.Width))
+                    {
+                        continue;
+                    }
+
+                    var desiredSizeWidth = headerCell.DesiredSize.Width;
+                    var width = widths[i];
+                    headerCell.Width = desiredSizeWidth > width ? desiredSizeWidth : width;
+                }
+
+                parent._isFirstTimeMeasuringCells = false;
+            }
+
+            stackDesiredSize = stackDesiredSize.WithHeight(stackDesiredSize.Height);
+            return stackDesiredSize;
+        }
+
+        protected override Size ArrangeOverride(Size finalSize)
+        {
+            var children = Children;
+            Rect rcChild = new Rect(finalSize);
+            double previousChildSize = 0.0;
+
+            for (int i = 0, count = children.Count; i < count; ++i)
+            {
+                var child = children[i];
+
+                if (!child.IsVisible)
+                {
+                    continue;
+                }
+
+                rcChild = rcChild.WithY(rcChild.Y + previousChildSize);
+                previousChildSize = child.DesiredSize.Height;
+                rcChild = rcChild.WithHeight(previousChildSize);
+                rcChild = rcChild.WithWidth(Math.Max(finalSize.Width, child.DesiredSize.Width));
+
+                child.Arrange(rcChild);
+            }
+
+            return finalSize;
         }
     }
 
@@ -945,13 +1122,13 @@ public class TreeListViewItem : TreeListView.Row
 
     string? _childPropertyName;
 
-    public TreeListViewItem(int level, TreeListView parent)
+    public TreeListViewItem(int level, TreeListView parent) : base(parent)
     {
         _propertyChangedSub = new(this, (target, sender, _, arg) => target.ItemPropertyChanged(sender, arg));
         _collectionChangedSub = new(this, (target, sender, _, arg) => target.ItemCollectionChanged(sender, arg));
 
         Level = level;
-        _parentTree = parent;
+        ParentTree = parent;
         this[!ShowSeparatorsProperty] = parent[!TreeListView.ShowGridProperty];
         SetValue(BackgroundProperty, Brushes.Transparent, BindingPriority.Style);
 
@@ -961,7 +1138,7 @@ public class TreeListViewItem : TreeListView.Row
     private TreeListView.RowDetailsPresenter? _rowDetailsPresenter;
 
     public int Level { get; }
-    private readonly TreeListView _parentTree;
+    internal readonly TreeListView ParentTree;
 
     protected override void OnPropertyChanged(AvaloniaPropertyChangedEventArgs change)
     {
@@ -980,7 +1157,7 @@ public class TreeListViewItem : TreeListView.Row
         }
         else if (change.Property == IsSelectedProperty)
         {
-            _parentTree.OnRowIsSelectedChanged(this, IsSelected);
+            ParentTree.OnRowIsSelectedChanged(this, IsSelected);
             UpdateRowDetails();
         }
 
@@ -1206,7 +1383,7 @@ public class TreeListViewItem : TreeListView.Row
 
         TreeListViewItem Create(object item)
         {
-            TreeListViewItem row = new(Level + 1, _parentTree)
+            TreeListViewItem row = new(Level + 1, ParentTree)
             {
                 DataContext = item,
                 Theme = Theme
@@ -1253,9 +1430,9 @@ public class TreeListViewItem : TreeListView.Row
 
     internal void UpdateRowDetails()
     {
-        var template = _parentTree.RowDetailsDataTemplate;
+        var template = ParentTree.RowDetailsDataTemplate;
 
-        if (template == null || (!IsSelected && !_parentTree.ShowRowDetails))
+        if (template == null || (!IsSelected && !ParentTree.ShowRowDetails))
         {
             if (_rowDetailsPresenter != null)
             {
